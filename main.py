@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template
 from woocommerce import API
+import requests
 
 app = Flask(__name__)
 
@@ -17,6 +18,18 @@ status_mapping = {
     "-1": "cancelled"    # Cancelled
 }
 
+BACKEND_WEBHOOK_URL = "https://gutmantra-webapp.onrender.com/webhook"
+
+status_mapping = {
+
+    "1": "processing",
+
+    "10": "completed",
+
+    "-1": "cancelled"
+
+}
+
 webhook_data = []
 
 
@@ -28,8 +41,19 @@ def webhook():
         if not data:
             return jsonify({"success": False, "message": "No data received"}), 400
 
-        webhook_data.append(data)
         print("Received webhook data:", data)
+        webhook_data.append(data)
+        try:
+            response = requests.post(
+                BACKEND_WEBHOOK_URL,
+                json=data,
+                timeout=10
+            )
+            print("✅ Sent to backend:", response.status_code)
+
+        except Exception as e:
+
+            print("❌ Backend sync failed:", e)
 
         order_id = data.get("orderID")
         status = data.get("status")
