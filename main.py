@@ -106,13 +106,31 @@ def create_order():
 
         items = []
         for item in body["items"]:
+
+            eid = item.get("id")
+
+            # ✅ STRICT EID VALIDATION — no SKU fallback, fail hard
+            if not eid or not str(eid).startswith("V"):
+                print(f"❌ Invalid or missing Petpooja EID for item: {item}")
+                return jsonify({
+                    "error": f"Invalid Petpooja EID for item '{item.get('name')}' — got '{eid}'. Must start with 'V'."
+                }), 400
+
             items.append({
-                "id": str(item.get("id") or item.get("sku")),
+                "id": str(eid),
                 "name": item.get("name"),
                 "price": float(item.get("price", 0)),
                 "quantity": int(item.get("quantity", 1)),
                 "tax_inclusive": 1
             })
+
+        # ✅ FAIL FAST if no valid items
+        if not items:
+            return jsonify({"error": "No valid items to send"}), 400
+
+        # ✅ DEBUG — log items before building payload
+        print("🔥 FINAL ORDER ITEMS SENT TO PETPOOJA:")
+        print(json.dumps(items, indent=2))
 
         payload = {
             "app_key": APP_KEY,
@@ -137,8 +155,16 @@ def create_order():
             "payment_mode": body.get("paymentMode", "COD")
         }
 
+        # ✅ DEBUG — log full payload before sending
+        print("📦 FULL PAYLOAD:")
+        print(json.dumps(payload, indent=2))
+
         res = requests.post(CREATE_URL, json=payload, timeout=10)
         data = res.json()
+
+        # ✅ DEBUG — log Petpooja response
+        print("✅ PETPOOJA RESPONSE:")
+        print(data)
 
         petpooja_id = data.get("clientorderID") or order_id
 
@@ -165,6 +191,7 @@ def create_order():
         return jsonify({"success": True, "petpooja": data})
 
     except Exception as e:
+        print(f"❌ create_order error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
