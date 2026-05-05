@@ -16,12 +16,22 @@ wcapi = API(
 )
 
 WC_STATUS_MAPPING = {
-    "1": "processing",   # Accepted
-    "10": "completed",   # Delivered
-    "-1": "cancelled"    # Cancelled
+    "1": "processing",
+    "10": "completed",
+    "-1": "cancelled"
 }
 
-SKIP_STATUSES = ["5", "4"]  # Ready / Dispatched — don't sync to WooCommerce
+SKIP_STATUSES = ["5", "4"]
+
+STATUS_LABELS = {
+    "pending": "Order Placed",
+    "1":  "Accepted by Kitchen",
+    "2":  "Preparing",
+    "4":  "Out for Delivery",
+    "5":  "Ready for Pickup",
+    "10": "Delivered",
+    "-1": "Cancelled",
+}
 
 # ================= PETPOOJA CONFIG =================
 
@@ -39,6 +49,7 @@ CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
 # ================= FIREBASE =================
 
 db = None
+firestore_module = None
 
 try:
     import firebase_admin
@@ -56,6 +67,7 @@ try:
             firebase_admin.initialize_app(cred)
 
         db = firestore.client()
+        firestore_module = firestore
         print("✅ Firebase initialized")
 
 except Exception as e:
@@ -78,7 +90,7 @@ def update_wc_order_status(order_id, status):
         print(f"❌ Error updating WooCommerce order {order_id}: {e}")
 
 
-# ================= CREATE ORDER (Petpooja) =================
+# ================= CREATE ORDER =================
 
 @app.route("/api/create-order", methods=["POST"])
 def create_order():
@@ -128,13 +140,35 @@ def create_order():
         res = requests.post(CREATE_URL, json=payload, timeout=10)
         data = res.json()
 
+        petpooja_id = data.get("clientorderID") or order_id
+
+        if db and firestore_module:
+            db.collection("orders").document(order_id).set({
+                "orderID": order_id,
+                "petpoojaID": petpooja_id,
+                "userId": order_id.split("_")[0],
+                "status": "pending",
+                "statusLabel": "Order Placed",
+                "items": items,
+                "total": sum(i["price"] * i["quantity"] for i in items),
+                "name": body["name"],
+                "phone": body["phone"],
+                "email": body.get("email", ""),
+                "address": body.get("address", ""),
+                "paymentMode": body.get("paymentMode", "COD"),
+                "createdAt": firestore_module.SERVER_TIMESTAMP,
+                "updatedAt": firestore_module.SERVER_TIMESTAMP,
+                "source": "petpooja"
+            }, merge=True)
+            print(f"✅ Firebase order created: {order_id}")
+
         return jsonify({"success": True, "petpooja": data})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ================= CANCEL ORDER (Petpooja) =================
+# ================= CANCEL ORDER =================
 
 @app.route("/api/cancel-order", methods=["POST"])
 def cancel_order():
@@ -157,6 +191,14 @@ def cancel_order():
 
         requests.post(CANCEL_URL, json=payload, timeout=10)
 
+        if db and firestore_module:
+            db.collection("orders").document(order_id).set({
+                "status": "-1",
+                "statusLabel": "Cancelled",
+                "updatedAt": firestore_module.SERVER_TIMESTAMP
+            }, merge=True)
+            print(f"✅ Firebase order cancelled: {order_id}")
+
         return jsonify({"success": True})
 
     except Exception as e:
@@ -177,6 +219,7 @@ def webhook():
 
         order_id = str(data.get("orderID", ""))
         status = str(data.get("status", ""))
+        label = STATUS_LABELS.get(status, status)
 
         # --- Update WooCommerce ---
         if order_id and status:
@@ -191,23 +234,20 @@ def webhook():
                     print(f"⚠️ No WooCommerce mapping for status '{status}'")
 
         # --- Update Firebase ---
-        if db:
+        if db and firestore_module:
             user_id = order_id.split("_")[0] if "_" in order_id else "guest"
 
-            order_data = {
-                "orderID": order_id,
-                "userId": user_id,
-                "status": status,
-                "items": data.get("OrderItem", []),
-                "total": data.get("order_total", 0),
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "source": "petpooja"
-            }
-
-            db.collection("orders").document(
-                order_id).set(order_data, merge=True)
-            print(f"✅ Firebase updated for order {order_id}")
+            db.collection("orders").document(order_id).set({
+                "orderID":     order_id,
+                "userId":      user_id,
+                "status":      status,
+                "statusLabel": label,
+                "items":       data.get("OrderItem", []),
+                "total":       data.get("order_total", 0),
+                "updatedAt":   firestore_module.SERVER_TIMESTAMP,
+                "source":      "petpooja"
+            }, merge=True)
+            print(f"✅ Firebase updated for order {order_id} → {label}")
         else:
             print("⚠️ Firebase not initialized, skipping DB write")
 
