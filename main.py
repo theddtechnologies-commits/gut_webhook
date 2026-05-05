@@ -3,6 +3,9 @@ import os
 import firebase_admin
 from firebase_admin import credentials, firestore
 from woocommerce import API
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
 
 # ================= FIREBASE INIT =================
 if not firebase_admin._apps:
@@ -32,17 +35,18 @@ status_mapping = {
     "-1": "cancelled"
 }
 
-# ================= HANDLER =================
+# ================= WEBHOOK =================
 
 
-def handler(request):
+@app.route("/api/webhook", methods=["POST"])
+def webhook():
     try:
         data = request.get_json()
 
         print("🔥 WEBHOOK RECEIVED:", data)
 
         if not data:
-            return {"statusCode": 400}
+            return jsonify({"error": "No data"}), 400
 
         # ================= HANDLE MULTIPLE ORDERS =================
         orders = []
@@ -52,23 +56,18 @@ def handler(request):
         elif "orderID" in data:
             orders = [data]
         else:
-            print("📦 Not an order webhook (probably menu)")
-            return {
-                "statusCode": 200,
-                "body": json.dumps({"message": "Ignored non-order webhook"})
-            }
+            print("📦 Not an order webhook")
+            return jsonify({"message": "Ignored"}), 200
 
-        # ================= PROCESS EACH ORDER =================
+        # ================= PROCESS =================
         for order in orders:
             order_id = str(order.get("orderID"))
 
             if not order_id:
                 continue
 
-            # 🔥 USER MAPPING (userId_timestamp)
             user_id = order_id.split("_")[0] if "_" in order_id else "guest"
 
-            # 🔥 EXTRACT SAFE FIELDS
             customer = order.get("customer", {}) or order.get("Customer", {})
             order_info = order.get("Order", {}) or {}
 
@@ -84,7 +83,6 @@ def handler(request):
                 or 0
             )
 
-            # ================= BUILD CLEAN OBJECT =================
             order_data = {
                 "orderID": order_id,
                 "userId": user_id,
@@ -101,37 +99,33 @@ def handler(request):
 
             print(f"💾 Saving Order: {order_id}")
 
-            # ================= SAVE GLOBAL =================
+            # FIRESTORE SAVE
             db.collection("orders").document(
                 order_id).set(order_data, merge=True)
 
-            # ================= SAVE USER =================
             db.collection("users").document(user_id)\
                 .collection("orders").document(order_id)\
                 .set(order_data, merge=True)
 
-            # ================= WOOCOMMERCE UPDATE =================
-            status = order.get("status")
+            # WOOCOMMERCE UPDATE
+            status = str(order.get("status"))
 
             if status not in ["5", "4"]:
-                wc_status = status_mapping.get(str(status))
+                wc_status = status_mapping.get(status)
 
                 if wc_status:
                     try:
                         wcapi.put(f"orders/{order_id}", {"status": wc_status})
                         print(f"✅ Woo updated {order_id} → {wc_status}")
                     except Exception as e:
-                        print("❌ Woo update failed:", e)
+                        print("❌ Woo error:", e)
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"success": True})
-        }
+        return jsonify({"success": True}), 200
 
     except Exception as e:
         print("❌ ERROR:", str(e))
+        return jsonify({"error": str(e)}), 500
 
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"error": str(e)})
-        }
+
+# REQUIRED FOR VERCEL
+app = app

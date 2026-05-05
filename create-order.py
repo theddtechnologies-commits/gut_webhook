@@ -1,5 +1,8 @@
 import json
 import requests
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
 
 # ================= CONFIG =================
 
@@ -11,13 +14,14 @@ REST_ID = "107556"
 
 PETPOOJA_URL = "https://pponlineordercb.petpooja.com/save_order"
 
-# ✅ YOUR ACTUAL DOMAIN
-CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/main"
+# ✅ FIXED CALLBACK
+CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
 
 
-# ================= HANDLER =================
+# ================= ROUTE =================
 
-def handler(request):
+@app.route("/api/create-order", methods=["POST"])
+def create_order():
     try:
         body = request.get_json()
 
@@ -27,13 +31,10 @@ def handler(request):
         required_fields = ["orderID", "name", "phone", "items"]
         for field in required_fields:
             if field not in body:
-                return {
-                    "statusCode": 400,
-                    "body": json.dumps({
-                        "success": False,
-                        "error": f"Missing field: {field}"
-                    })
-                }
+                return jsonify({
+                    "success": False,
+                    "error": f"Missing field: {field}"
+                }), 400
 
         order_id = str(body["orderID"])
 
@@ -41,7 +42,7 @@ def handler(request):
         items = []
         for item in body["items"]:
             items.append({
-                "id": str(item.get("id")),  # MUST be Petpooja item ID
+                "id": str(item.get("id")),  # MUST be Petpooja ID
                 "name": item.get("name"),
                 "price": float(item.get("price", 0)),
                 "quantity": int(item.get("quantity", 1)),
@@ -53,12 +54,9 @@ def handler(request):
             "app_key": APP_KEY,
             "app_secret": APP_SECRET,
             "access_token": ACCESS_TOKEN,
-
             "restID": REST_ID,
             "device_type": "Web",
-
             "callback_url": CALLBACK_URL,
-
             "OrderInfo": {
                 "Customer": {
                     "name": body["name"],
@@ -72,9 +70,7 @@ def handler(request):
                 },
                 "OrderItem": items
             },
-
-            # 🔥 PAYMENT MODE SUPPORT
-            "payment_mode": body.get("paymentMode", "COD")  # COD / ONLINE
+            "payment_mode": body.get("paymentMode", "COD")
         }
 
         print("📦 Sending to Petpooja:", payload)
@@ -88,36 +84,35 @@ def handler(request):
 
         response_data = response.json()
 
-        print("✅ Petpooja Response:", response_data)
+        print("📩 Petpooja Raw Response:", response_data)
 
-        # ================= FAILURE HANDLING =================
-        if response.status_code != 200:
-            return {
-                "statusCode": 500,
-                "body": json.dumps({
-                    "success": False,
-                    "error": "Petpooja API failed",
-                    "response": response_data
-                })
-            }
+        # ================= STRICT VALIDATION =================
+        if (
+            response.status_code != 200 or
+            response_data.get("success") == False or
+            response_data.get("status") == "failed"
+        ):
+            return jsonify({
+                "success": False,
+                "error": "Petpooja rejected order",
+                "response": response_data
+            }), 500
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps({
-                "success": True,
-                "message": "Order sent to Petpooja",
-                "orderID": order_id,
-                "petpooja_response": response_data
-            })
-        }
+        return jsonify({
+            "success": True,
+            "message": "Order sent to Petpooja",
+            "orderID": order_id,
+            "petpooja_response": response_data
+        }), 200
 
     except Exception as e:
         print("❌ ERROR:", str(e))
 
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "success": False,
-                "error": str(e)
-            })
-        }
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# REQUIRED FOR VERCEL
+app = app
