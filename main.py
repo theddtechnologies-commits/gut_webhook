@@ -136,23 +136,50 @@ def create_order():
             "app_key": APP_KEY,
             "app_secret": APP_SECRET,
             "access_token": ACCESS_TOKEN,
-            "restID": REST_ID,
-            "device_type": "Web",
-            "callback_url": CALLBACK_URL,
-            "OrderInfo": {
-                "Customer": {
-                    "name": body["name"],
-                    "phone": body["phone"],
-                    "email": body.get("email", ""),
-                    "address": body.get("address", "")
+
+            "orderinfo": {
+                "OrderInfo": {
+                    "Restaurant": {
+                        "details": {
+                            "restID": REST_ID
+                        }
+                    },
+
+                    "Customer": {
+                        "details": {
+                            "name": body["name"],
+                            "phone": body["phone"],
+                            "email": body.get("email", ""),
+                            "address": body.get("address", "")
+                        }
+                    },
+
+                    "Order": {
+                        "details": {
+                            "orderID": order_id,
+                            "order_type": "H",  # 🔥 delivery
+                            "payment_type": body.get("paymentMode", "COD"),
+                            "callback_url": CALLBACK_URL,
+                            "total": str(sum(i["price"] * i["quantity"] for i in items))
+                        }
+                    },
+
+                    "OrderItem": {
+                        "details": [
+                            {
+                                "id": item["id"],  # 🔥 EID
+                                "name": item["name"],
+                                "price": str(item["price"]),
+                                "quantity": str(item["quantity"]),
+                                "tax_inclusive": True
+                            }
+                            for item in items
+                        ]
+                    }
                 },
-                "Order": {
-                    "orderID": order_id,
-                    "preorder_date": ""
-                },
-                "OrderItem": items
-            },
-            "payment_mode": body.get("paymentMode", "COD")
+
+                "device_type": "Web"
+            }
         }
 
         # ✅ DEBUG — log full payload before sending
