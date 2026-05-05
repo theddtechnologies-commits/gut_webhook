@@ -25,10 +25,10 @@ SKIP_STATUSES = ["5", "4"]
 
 STATUS_LABELS = {
     "pending": "Order Placed",
-    "1":  "Accepted by Kitchen",
-    "2":  "Preparing",
-    "4":  "Out for Delivery",
-    "5":  "Ready for Pickup",
+    "1": "Accepted by Kitchen",
+    "2": "Preparing",
+    "4": "Out for Delivery",
+    "5": "Ready for Pickup",
     "10": "Delivered",
     "-1": "Cancelled",
 }
@@ -74,22 +74,6 @@ except Exception as e:
     print("❌ Firebase error:", e)
 
 
-# ================= WOOCOMMERCE HELPER =================
-
-def update_wc_order_status(order_id, status):
-    try:
-        order = wcapi.get(f"orders/{order_id}").json()
-        if order:
-            response = wcapi.put(
-                f"orders/{order_id}", {"status": status}).json()
-            print(
-                f"✅ WooCommerce order {order_id} updated to '{status}': {response}")
-        else:
-            print(f"⚠️ WooCommerce order {order_id} not found.")
-    except Exception as e:
-        print(f"❌ Error updating WooCommerce order {order_id}: {e}")
-
-
 # ================= CREATE ORDER =================
 
 @app.route("/api/create-order", methods=["POST"])
@@ -104,121 +88,98 @@ def create_order():
 
         order_id = str(body["orderID"])
 
+        # 🔥 STRICT ITEM VALIDATION
         items = []
         for item in body["items"]:
-
             eid = item.get("id")
 
-            # ✅ STRICT EID VALIDATION — no SKU fallback, fail hard
             if not eid or not str(eid).startswith("V"):
-                print(f"❌ Invalid or missing Petpooja EID for item: {item}")
                 return jsonify({
-                    "error": f"Invalid Petpooja EID for item '{item.get('name')}' — got '{eid}'. Must start with 'V'."
+                    "error": f"Invalid EID for item {item.get('name')}: {eid}"
                 }), 400
 
             items.append({
                 "id": str(eid),
                 "name": item.get("name"),
-                "price": float(item.get("price", 0)),
-                "quantity": int(item.get("quantity", 1)),
-                "tax_inclusive": 1
+                "price": str(item.get("price")),      # ✅ STRING
+                "quantity": str(item.get("quantity")),  # ✅ STRING
+                "tax_inclusive": 1                    # ✅ REQUIRED
             })
 
-        # ✅ FAIL FAST if no valid items
-        if not items:
-            return jsonify({"error": "No valid items to send"}), 400
+        print("🔥 FINAL ITEMS →", json.dumps(items, indent=2))
 
-        # ✅ DEBUG — log items before building payload
-        print("🔥 FINAL ORDER ITEMS SENT TO PETPOOJA:")
-        print(json.dumps(items, indent=2))
-
+        # 🔥 FINAL PAYLOAD
         payload = {
             "app_key": APP_KEY,
             "app_secret": APP_SECRET,
             "access_token": ACCESS_TOKEN,
-
-            "orderinfo": {
-                "OrderInfo": {
-                    "Restaurant": {
-                        "details": {
-                            "restID": REST_ID
-                        }
-                    },
-
-                    "Customer": {
-                        "details": {
-                            "name": body["name"],
-                            "phone": body["phone"],
-                            "email": body.get("email", ""),
-                            "address": body.get("address", "")
-                        }
-                    },
-
-                    "Order": {
-                        "details": {
-                            "orderID": order_id,
-                            "order_type": "H",  # 🔥 delivery
-                            "payment_type": body.get("paymentMode", "COD"),
-                            "callback_url": CALLBACK_URL,
-                            "total": str(sum(i["price"] * i["quantity"] for i in items))
-                        }
-                    },
-
-                    "OrderItem": {
-                        "details": [
-                            {
-                                "id": item["id"],  # 🔥 EID
-                                "name": item["name"],
-                                "price": str(item["price"]),
-                                "quantity": str(item["quantity"]),
-                                "tax_inclusive": True
-                            }
-                            for item in items
-                        ]
-                    }
+            "restID": REST_ID,
+            "device_type": "Android",   # ✅ safer than Web
+            "callback_url": CALLBACK_URL,
+            "OrderInfo": {
+                "Customer": {
+                    "name": body["name"],
+                    "phone": body["phone"],
+                    "email": body.get("email", ""),
+                    "address": body.get("address", "")
                 },
-
-                "device_type": "Web"
-            }
+                "Order": {
+                    "orderID": order_id,
+                    "preorder_date": ""   # ✅ IMPORTANT
+                },
+                "OrderItem": items
+            },
+            "payment_mode": body.get("paymentMode", "COD")
         }
 
-        # ✅ DEBUG — log full payload before sending
-        print("📦 FULL PAYLOAD:")
+        print("📦 PAYLOAD →")
         print(json.dumps(payload, indent=2))
 
         res = requests.post(CREATE_URL, json=payload, timeout=10)
-        data = res.json()
 
-        # ✅ DEBUG — log Petpooja response
-        print("✅ PETPOOJA RESPONSE:")
-        print(data)
+        try:
+            data = res.json()
+        except:
+            data = {"raw": res.text}
 
-        petpooja_id = data.get("clientorderID") or order_id
+        print("📡 STATUS:", res.status_code)
+        print("📡 RESPONSE:", data)
 
+        # ❌ HARD FAIL if Petpooja rejects
+        if res.status_code != 200 or data.get("success") != "1":
+            return jsonify({
+                "success": False,
+                "petpooja_error": data
+            }), 400
+
+        # ✅ SAVE TO FIREBASE
         if db and firestore_module:
             db.collection("orders").document(order_id).set({
                 "orderID": order_id,
-                "petpoojaID": petpooja_id,
+                "petpoojaID": data.get("clientorderID"),
                 "userId": order_id.split("_")[0],
                 "status": "pending",
                 "statusLabel": "Order Placed",
                 "items": items,
-                "total": sum(i["price"] * i["quantity"] for i in items),
+                "total": sum(float(i["price"]) * int(i["quantity"]) for i in items),
                 "name": body["name"],
                 "phone": body["phone"],
-                "email": body.get("email", ""),
                 "address": body.get("address", ""),
                 "paymentMode": body.get("paymentMode", "COD"),
                 "createdAt": firestore_module.SERVER_TIMESTAMP,
                 "updatedAt": firestore_module.SERVER_TIMESTAMP,
                 "source": "petpooja"
             }, merge=True)
-            print(f"✅ Firebase order created: {order_id}")
 
-        return jsonify({"success": True, "petpooja": data})
+            print(f"✅ Firebase order saved: {order_id}")
+
+        return jsonify({
+            "success": True,
+            "petpooja": data
+        })
 
     except Exception as e:
-        print(f"❌ create_order error: {e}")
+        print("❌ ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -243,91 +204,26 @@ def cancel_order():
             "cancelReason": body.get("reason", "User cancelled")
         }
 
-        requests.post(CANCEL_URL, json=payload, timeout=10)
+        res = requests.post(CANCEL_URL, json=payload, timeout=10)
+        data = res.json()
 
-        if db and firestore_module:
-            db.collection("orders").document(order_id).set({
-                "status": "-1",
-                "statusLabel": "Cancelled",
-                "updatedAt": firestore_module.SERVER_TIMESTAMP
-            }, merge=True)
-            print(f"✅ Firebase order cancelled: {order_id}")
+        print("🚫 CANCEL RESPONSE:", data)
 
-        return jsonify({"success": True})
+        return jsonify({"success": True, "response": data})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ================= WEBHOOK (Petpooja → Firebase + WooCommerce) =================
+# ================= WEBHOOK =================
 
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json()
-
-        if not data:
-            return jsonify({"success": False, "message": "No data received"}), 400
-
         print("🔔 WEBHOOK:", data)
 
-        order_id = str(data.get("orderID", ""))
-        status = str(data.get("status", ""))
-        label = STATUS_LABELS.get(status, status)
-
-        # --- Update WooCommerce ---
-        if order_id and status:
-            if status in SKIP_STATUSES:
-                print(
-                    f"⏭️ Skipping WooCommerce update for order {order_id} (status {status})")
-            else:
-                wc_status = WC_STATUS_MAPPING.get(status)
-                if wc_status:
-                    update_wc_order_status(order_id, wc_status)
-                else:
-                    print(f"⚠️ No WooCommerce mapping for status '{status}'")
-
-        # --- Update Firebase ---
-        if db and firestore_module:
-            user_id = order_id.split("_")[0] if "_" in order_id else "guest"
-
-            db.collection("orders").document(order_id).set({
-                "orderID":     order_id,
-                "userId":      user_id,
-                "status":      status,
-                "statusLabel": label,
-                "items":       data.get("OrderItem", []),
-                "total":       data.get("order_total", 0),
-                "updatedAt":   firestore_module.SERVER_TIMESTAMP,
-                "source":      "petpooja"
-            }, merge=True)
-            print(f"✅ Firebase updated for order {order_id} → {label}")
-        else:
-            print("⚠️ Firebase not initialized, skipping DB write")
-
-        return jsonify({
-            "success": True,
-            "message": "Webhook received and processed successfully",
-            "receivedData": data
-        }), 200
-
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-# ================= GET WEBHOOK DATA =================
-
-@app.route("/api/webhook-data", methods=["GET"])
-def get_webhook_data():
-    try:
-        if not db:
-            return jsonify({"success": False, "message": "Firebase not initialized"}), 500
-
-        orders = db.collection("orders").stream()
-        data = [doc.to_dict() for doc in orders]
-
-        return jsonify({"success": True, "data": data})
+        return jsonify({"success": True})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
