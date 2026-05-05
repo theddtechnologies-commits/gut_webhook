@@ -1,18 +1,9 @@
+from flask import Flask, request, jsonify
 import json
 import os
 import requests
 
-# ================= SAFE FIREBASE IMPORT =================
-
-firebase_admin = None
-firestore = None
-
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-except Exception as e:
-    print("❌ Firebase import failed:", e)
-
+app = Flask(__name__)
 
 # ================= CONFIG =================
 
@@ -27,69 +18,43 @@ CANCEL_URL = "https://pponlineordercb.petpooja.com/update_order_status"
 
 CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
 
-
-# ================= FIREBASE INIT =================
+# ================= FIREBASE =================
 
 db = None
 
-if firebase_admin:
-    try:
-        firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
 
-        if firebase_env:
-            firebase_json = json.loads(firebase_env)
-            firebase_json["private_key"] = firebase_json["private_key"].replace(
-                "\\n", "\n")
+    firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
-            if not firebase_admin._apps:
-                cred = credentials.Certificate(firebase_json)
-                firebase_admin.initialize_app(cred)
+    if firebase_env:
+        firebase_json = json.loads(firebase_env)
+        firebase_json["private_key"] = firebase_json["private_key"].replace(
+            "\\n", "\n")
 
-            db = firestore.client()
-            print("✅ Firebase initialized")
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(firebase_json)
+            firebase_admin.initialize_app(cred)
 
-        else:
-            print("⚠️ FIREBASE_SERVICE_ACCOUNT missing")
+        db = firestore.client()
+        print("✅ Firebase initialized")
 
-    except Exception as e:
-        print("❌ Firebase init error:", e)
-
-
-# ================= MAIN HANDLER =================
-
-def handler(request):
-    try:
-        path = request.path
-
-        raw_body = request.body
-        data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-
-        print("📩 Incoming:", data)
-
-        if "/create-order" in path:
-            return create_order(data)
-
-        elif "/cancel-order" in path:
-            return cancel_order(data)
-
-        elif "/webhook" in path:
-            return webhook_handler(data)
-
-        return response(404, {"error": "Route not found"})
-
-    except Exception as e:
-        print("🔥 CRASH:", str(e))
-        return response(500, {"error": str(e)})
+except Exception as e:
+    print("❌ Firebase error:", e)
 
 
 # ================= CREATE ORDER =================
 
-def create_order(body):
+@app.route("/api/create-order", methods=["POST"])
+def create_order():
     try:
+        body = request.json
+
         required = ["orderID", "name", "phone", "items"]
         for f in required:
             if f not in body:
-                return response(400, {"error": f"{f} missing"})
+                return jsonify({"error": f"{f} missing"}), 400
 
         order_id = str(body["orderID"])
 
@@ -126,35 +91,28 @@ def create_order(body):
             "payment_mode": body.get("paymentMode", "COD")
         }
 
-        print("📦 Sending to Petpooja:", payload)
-
         res = requests.post(CREATE_URL, json=payload, timeout=10)
         data = res.json()
 
-        print("✅ Petpooja:", data)
-
-        if res.status_code != 200:
-            return response(500, {"error": data})
-
-        return response(200, {
+        return jsonify({
             "success": True,
-            "orderID": order_id,
             "petpooja": data
         })
 
     except Exception as e:
-        print("❌ CREATE ERROR:", str(e))
-        return response(500, {"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
 
 # ================= CANCEL ORDER =================
 
-def cancel_order(body):
+@app.route("/api/cancel-order", methods=["POST"])
+def cancel_order():
     try:
+        body = request.json
         order_id = body.get("orderID")
 
         if not order_id:
-            return response(400, {"error": "orderID required"})
+            return jsonify({"error": "orderID required"}), 400
 
         payload = {
             "app_key": APP_KEY,
@@ -166,73 +124,48 @@ def cancel_order(body):
             "cancelReason": body.get("reason", "User cancelled")
         }
 
-        print("🚫 Cancel:", payload)
-
         res = requests.post(CANCEL_URL, json=payload, timeout=10)
-        data = res.json()
 
-        if res.status_code != 200:
-            return response(500, {"error": data})
-
-        return response(200, {"success": True})
+        return jsonify({"success": True})
 
     except Exception as e:
-        print("❌ CANCEL ERROR:", str(e))
-        return response(500, {"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
 
 # ================= WEBHOOK =================
 
-def webhook_handler(data):
+@app.route("/api/webhook", methods=["POST"])
+def webhook():
     try:
+        data = request.json
+
         print("🔔 WEBHOOK:", data)
 
         if not db:
-            return response(200, {"warning": "No DB"})
+            return jsonify({"warning": "No DB"})
 
-        orders = []
+        order_id = str(data.get("orderID"))
 
-        if "orders" in data:
-            orders = data["orders"]
-        elif "orderID" in data:
-            orders = [data]
-        else:
-            return response(200, {"message": "ignored"})
+        user_id = order_id.split("_")[0] if "_" in order_id else "guest"
 
-        for order in orders:
-            order_id = str(order.get("orderID"))
+        order_data = {
+            "orderID": order_id,
+            "userId": user_id,
+            "status": data.get("status"),
+            "items": data.get("OrderItem", []),
+            "total": data.get("order_total", 0),
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "source": "petpooja"
+        }
 
-            user_id = order_id.split("_")[0] if "_" in order_id else "guest"
+        db.collection("orders").document(order_id).set(order_data, merge=True)
 
-            order_data = {
-                "orderID": order_id,
-                "userId": user_id,
-                "status": order.get("status"),
-                "items": order.get("OrderItem", []),
-                "total": order.get("order_total", 0),
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "source": "petpooja",
-                "payload": order
-            }
-
-            db.collection("orders").document(
-                order_id).set(order_data, merge=True)
-
-        return response(200, {"success": True})
+        return jsonify({"success": True})
 
     except Exception as e:
-        print("❌ WEBHOOK ERROR:", str(e))
-        return response(500, {"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
 
-# ================= RESPONSE =================
-
-def response(status, body):
-    return {
-        "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json"
-        },
-        "body": json.dumps(body)
-    }
+if __name__ == "__main__":
+    app.run(debug=True)
