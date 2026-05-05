@@ -1,8 +1,18 @@
 import json
 import os
 import requests
-import firebase_admin
-from firebase_admin import credentials, firestore
+
+# ================= SAFE FIREBASE IMPORT =================
+
+firebase_admin = None
+firestore = None
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except Exception as e:
+    print("❌ Firebase import failed:", e)
+
 
 # ================= CONFIG =================
 
@@ -17,34 +27,44 @@ CANCEL_URL = "https://pponlineordercb.petpooja.com/update_order_status"
 
 CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
 
+
 # ================= FIREBASE INIT =================
 
-if not firebase_admin._apps:
-    firebase_json = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT"))
+db = None
 
-    firebase_json["private_key"] = firebase_json["private_key"].replace(
-        "\\n", "\n")
+if firebase_admin:
+    try:
+        firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
-    cred = credentials.Certificate(firebase_json)
-    firebase_admin.initialize_app(cred)
+        if firebase_env:
+            firebase_json = json.loads(firebase_env)
+            firebase_json["private_key"] = firebase_json["private_key"].replace(
+                "\\n", "\n")
 
-db = firestore.client()
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(firebase_json)
+                firebase_admin.initialize_app(cred)
+
+            db = firestore.client()
+            print("✅ Firebase initialized")
+
+        else:
+            print("⚠️ FIREBASE_SERVICE_ACCOUNT missing")
+
+    except Exception as e:
+        print("❌ Firebase init error:", e)
+
 
 # ================= MAIN HANDLER =================
-
 
 def handler(request):
     try:
         path = request.path
 
-        # 🔥 SAFE JSON PARSE (VERCEL FIX)
-        try:
-            raw_body = request.body
-            data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            print("📩 Incoming:", data)
-        except Exception as e:
-            print("❌ JSON ERROR:", str(e))
-            return response(400, {"error": "Invalid JSON"})
+        raw_body = request.body
+        data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+
+        print("📩 Incoming:", data)
 
         if "/create-order" in path:
             return create_order(data)
@@ -55,15 +75,14 @@ def handler(request):
         elif "/webhook" in path:
             return webhook_handler(data)
 
-        else:
-            return response(404, {"error": "Route not found"})
+        return response(404, {"error": "Route not found"})
 
     except Exception as e:
         print("🔥 CRASH:", str(e))
         return response(500, {"error": str(e)})
 
-# ================= CREATE ORDER =================
 
+# ================= CREATE ORDER =================
 
 def create_order(body):
     try:
@@ -77,7 +96,7 @@ def create_order(body):
         items = []
         for item in body["items"]:
             items.append({
-                "id": str(item.get("id") or item.get("sku")),  # SKU fallback
+                "id": str(item.get("id") or item.get("sku")),
                 "name": item.get("name"),
                 "price": float(item.get("price", 0)),
                 "quantity": int(item.get("quantity", 1)),
@@ -91,7 +110,6 @@ def create_order(body):
             "restID": REST_ID,
             "device_type": "Web",
             "callback_url": CALLBACK_URL,
-
             "OrderInfo": {
                 "Customer": {
                     "name": body["name"],
@@ -105,7 +123,6 @@ def create_order(body):
                 },
                 "OrderItem": items
             },
-
             "payment_mode": body.get("paymentMode", "COD")
         }
 
@@ -129,13 +146,12 @@ def create_order(body):
         print("❌ CREATE ERROR:", str(e))
         return response(500, {"error": str(e)})
 
-# ================= CANCEL ORDER =================
 
+# ================= CANCEL ORDER =================
 
 def cancel_order(body):
     try:
         order_id = body.get("orderID")
-        reason = body.get("reason", "User cancelled")
 
         if not order_id:
             return response(400, {"error": "orderID required"})
@@ -147,7 +163,7 @@ def cancel_order(body):
             "restID": REST_ID,
             "clientorderID": order_id,
             "status": "-1",
-            "cancelReason": reason
+            "cancelReason": body.get("reason", "User cancelled")
         }
 
         print("🚫 Cancel:", payload)
@@ -155,18 +171,24 @@ def cancel_order(body):
         res = requests.post(CANCEL_URL, json=payload, timeout=10)
         data = res.json()
 
-        return response(200, {"success": True, "response": data})
+        if res.status_code != 200:
+            return response(500, {"error": data})
+
+        return response(200, {"success": True})
 
     except Exception as e:
         print("❌ CANCEL ERROR:", str(e))
         return response(500, {"error": str(e)})
 
-# ================= WEBHOOK =================
 
+# ================= WEBHOOK =================
 
 def webhook_handler(data):
     try:
         print("🔔 WEBHOOK:", data)
+
+        if not db:
+            return response(200, {"warning": "No DB"})
 
         orders = []
 
@@ -188,8 +210,6 @@ def webhook_handler(data):
                 "status": order.get("status"),
                 "items": order.get("OrderItem", []),
                 "total": order.get("order_total", 0),
-                "customerName": order.get("customer_name"),
-                "customerPhone": order.get("customer_phone"),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
                 "createdAt": firestore.SERVER_TIMESTAMP,
                 "source": "petpooja",
@@ -199,18 +219,14 @@ def webhook_handler(data):
             db.collection("orders").document(
                 order_id).set(order_data, merge=True)
 
-            db.collection("users").document(user_id)\
-                .collection("orders").document(order_id)\
-                .set(order_data, merge=True)
-
         return response(200, {"success": True})
 
     except Exception as e:
         print("❌ WEBHOOK ERROR:", str(e))
         return response(500, {"error": str(e)})
 
-# ================= RESPONSE =================
 
+# ================= RESPONSE =================
 
 def response(status, body):
     return {
