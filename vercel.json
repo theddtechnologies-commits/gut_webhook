@@ -11,5 +11,11 @@
       "src": "/(.*)",
       "dest": "main.py"
     }
-  ]
+  ],
+
+  "functions": {
+    "api/*.py": {
+      "runtime": "python3.9"
+    }
+  }
 }

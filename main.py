@@ -1,16 +1,21 @@
 import json
 import os
+import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
-from woocommerce import API
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # ================= FIREBASE INIT =================
-if not firebase_admin._apps:
-    firebase_json = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT"))
 
+if not firebase_admin._apps:
+    firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+
+    if not firebase_env:
+        raise Exception("FIREBASE_SERVICE_ACCOUNT missing")
+
+    firebase_json = json.loads(firebase_env)
     firebase_json["private_key"] = firebase_json["private_key"].replace(
         "\\n", "\n")
 
@@ -19,13 +24,20 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# ================= WOOCOMMERCE =================
-wcapi = API(
-    url="https://gutmantra.in",
-    consumer_key="ck_4dfb44306941ede97fb309dc441abfa42c3fdc87",
-    consumer_secret="cs_d2808f39b2879c7a4a18d30db43c77dd036a61e7",
-    version="wc/v3"
-)
+# ================= PETPOOJA CONFIG =================
+
+APP_KEY = "73nywgsd0ab6hu4qz51ro2kfemt8xcpv"
+APP_SECRET = "aaef5fe113c373a0a7ac4e8a6413c5b1c46c3a8b"
+ACCESS_TOKEN = "23a33ca178836da5b3144ab299ef1bc2633e21f6"
+
+REST_ID = "107556"
+
+SAVE_ORDER_URL = "https://pponlineordercb.petpooja.com/save_order"
+CANCEL_URL = "https://pponlineordercb.petpooja.com/update_order_status"
+
+CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
+
+# ================= STATUS MAP =================
 
 status_mapping = {
     "1": "processing",
@@ -35,20 +47,79 @@ status_mapping = {
     "-1": "cancelled"
 }
 
-# ================= WEBHOOK =================
+# =========================================================
+# 🔥 CREATE ORDER
+# =========================================================
 
+
+@app.route("/api/create-order", methods=["POST"])
+def create_order():
+    try:
+        body = request.get_json()
+
+        print("🔥 Incoming Order:", body)
+
+        order_id = str(body["orderID"])
+
+        items = []
+        for item in body["items"]:
+            items.append({
+                "id": str(item.get("id")),  # MUST be Petpooja ID
+                "name": item.get("name"),
+                "price": float(item.get("price", 0)),
+                "quantity": int(item.get("quantity", 1)),
+                "tax_inclusive": 1
+            })
+
+        payload = {
+            "app_key": APP_KEY,
+            "app_secret": APP_SECRET,
+            "access_token": ACCESS_TOKEN,
+            "restID": REST_ID,
+            "device_type": "Web",
+            "callback_url": CALLBACK_URL,
+            "OrderInfo": {
+                "Customer": {
+                    "name": body["name"],
+                    "phone": body["phone"],
+                    "email": body.get("email", ""),
+                    "address": body.get("address", "")
+                },
+                "Order": {
+                    "orderID": order_id,
+                    "preorder_date": ""
+                },
+                "OrderItem": items
+            },
+            "payment_mode": body.get("paymentMode", "COD")
+        }
+
+        res = requests.post(SAVE_ORDER_URL, json=payload, timeout=10)
+        data = res.json()
+
+        print("📩 Petpooja Response:", data)
+
+        if res.status_code != 200:
+            return jsonify({"success": False, "error": data}), 500
+
+        return jsonify({"success": True, "orderID": order_id})
+
+    except Exception as e:
+        print("❌ ERROR:", str(e))
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================================================
+# 🔥 WEBHOOK (Petpooja → Firestore)
+# =========================================================
 
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json()
 
-        print("🔥 WEBHOOK RECEIVED:", data)
+        print("🔥 WEBHOOK:", data)
 
-        if not data:
-            return jsonify({"error": "No data"}), 400
-
-        # ================= HANDLE MULTIPLE ORDERS =================
         orders = []
 
         if "orders" in data:
@@ -56,71 +127,68 @@ def webhook():
         elif "orderID" in data:
             orders = [data]
         else:
-            print("📦 Not an order webhook")
-            return jsonify({"message": "Ignored"}), 200
+            return jsonify({"message": "ignored"}), 200
 
-        # ================= PROCESS =================
         for order in orders:
             order_id = str(order.get("orderID"))
 
-            if not order_id:
-                continue
-
             user_id = order_id.split("_")[0] if "_" in order_id else "guest"
-
-            customer = order.get("customer", {}) or order.get("Customer", {})
-            order_info = order.get("Order", {}) or {}
-
-            order_items = (
-                order.get("items")
-                or order.get("OrderItem")
-                or []
-            )
-
-            total = (
-                order.get("order_total")
-                or order_info.get("total")
-                or 0
-            )
 
             order_data = {
                 "orderID": order_id,
                 "userId": user_id,
                 "status": order.get("status"),
-                "items": order_items,
-                "total": total,
-                "customerName": customer.get("name") or order.get("customer_name"),
-                "customerPhone": customer.get("phone") or order.get("customer_phone"),
+                "items": order.get("items") or order.get("OrderItem") or [],
+                "total": order.get("order_total", 0),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
                 "createdAt": firestore.SERVER_TIMESTAMP,
-                "source": "petpooja",
                 "payload": order
             }
 
-            print(f"💾 Saving Order: {order_id}")
-
-            # FIRESTORE SAVE
+            # SAVE GLOBAL
             db.collection("orders").document(
                 order_id).set(order_data, merge=True)
 
+            # SAVE USER
             db.collection("users").document(user_id)\
                 .collection("orders").document(order_id)\
                 .set(order_data, merge=True)
 
-            # WOOCOMMERCE UPDATE
-            status = str(order.get("status"))
+        return jsonify({"success": True})
 
-            if status not in ["5", "4"]:
-                wc_status = status_mapping.get(status)
+    except Exception as e:
+        print("❌ ERROR:", str(e))
+        return jsonify({"error": str(e)}), 500
 
-                if wc_status:
-                    try:
-                        wcapi.put(f"orders/{order_id}", {"status": wc_status})
-                        print(f"✅ Woo updated {order_id} → {wc_status}")
-                    except Exception as e:
-                        print("❌ Woo error:", e)
 
-        return jsonify({"success": True}), 200
+# =========================================================
+# 🔥 CANCEL ORDER
+# =========================================================
+
+@app.route("/api/cancel-order", methods=["POST"])
+def cancel_order():
+    try:
+        body = request.get_json()
+
+        order_id = body.get("orderID")
+        reason = body.get("reason", "User cancelled")
+
+        payload = {
+            "app_key": APP_KEY,
+            "app_secret": APP_SECRET,
+            "access_token": ACCESS_TOKEN,
+            "restID": REST_ID,
+            "clientorderID": str(order_id),
+            "status": "-1",
+            "cancelReason": reason
+        }
+
+        res = requests.post(CANCEL_URL, json=payload, timeout=10)
+        data = res.json()
+
+        print("🔥 Cancel Response:", data)
+
+        return jsonify({"success": True, "response": data})
 
     except Exception as e:
         print("❌ ERROR:", str(e))
