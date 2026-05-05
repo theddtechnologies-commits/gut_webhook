@@ -1,11 +1,29 @@
 from flask import Flask, request, jsonify
+from woocommerce import API
 import json
 import os
 import requests
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
+# ================= WOOCOMMERCE CONFIG =================
+
+wcapi = API(
+    url="https://gutmantra.in",
+    consumer_key="ck_4dfb44306941ede97fb309dc441abfa42c3fdc87",
+    consumer_secret="cs_d2808f39b2879c7a4a18d30db43c77dd036a61e7",
+    version="wc/v3"
+)
+
+WC_STATUS_MAPPING = {
+    "1": "processing",   # Accepted
+    "10": "completed",   # Delivered
+    "-1": "cancelled"    # Cancelled
+}
+
+SKIP_STATUSES = ["5", "4"]  # Ready / Dispatched — don't sync to WooCommerce
+
+# ================= PETPOOJA CONFIG =================
 
 APP_KEY = "73nywgsd0ab6hu4qz51ro2kfemt8xcpv"
 APP_SECRET = "aaef5fe113c373a0a7ac4e8a6413c5b1c46c3a8b"
@@ -44,7 +62,23 @@ except Exception as e:
     print("❌ Firebase error:", e)
 
 
-# ================= CREATE ORDER =================
+# ================= WOOCOMMERCE HELPER =================
+
+def update_wc_order_status(order_id, status):
+    try:
+        order = wcapi.get(f"orders/{order_id}").json()
+        if order:
+            response = wcapi.put(
+                f"orders/{order_id}", {"status": status}).json()
+            print(
+                f"✅ WooCommerce order {order_id} updated to '{status}': {response}")
+        else:
+            print(f"⚠️ WooCommerce order {order_id} not found.")
+    except Exception as e:
+        print(f"❌ Error updating WooCommerce order {order_id}: {e}")
+
+
+# ================= CREATE ORDER (Petpooja) =================
 
 @app.route("/api/create-order", methods=["POST"])
 def create_order():
@@ -94,16 +128,13 @@ def create_order():
         res = requests.post(CREATE_URL, json=payload, timeout=10)
         data = res.json()
 
-        return jsonify({
-            "success": True,
-            "petpooja": data
-        })
+        return jsonify({"success": True, "petpooja": data})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ================= CANCEL ORDER =================
+# ================= CANCEL ORDER (Petpooja) =================
 
 @app.route("/api/cancel-order", methods=["POST"])
 def cancel_order():
@@ -124,7 +155,7 @@ def cancel_order():
             "cancelReason": body.get("reason", "User cancelled")
         }
 
-        res = requests.post(CANCEL_URL, json=payload, timeout=10)
+        requests.post(CANCEL_URL, json=payload, timeout=10)
 
         return jsonify({"success": True})
 
@@ -132,36 +163,77 @@ def cancel_order():
         return jsonify({"error": str(e)}), 500
 
 
-# ================= WEBHOOK =================
+# ================= WEBHOOK (Petpooja → Firebase + WooCommerce) =================
 
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.json
+        data = request.get_json()
+
+        if not data:
+            return jsonify({"success": False, "message": "No data received"}), 400
 
         print("🔔 WEBHOOK:", data)
 
+        order_id = str(data.get("orderID", ""))
+        status = str(data.get("status", ""))
+
+        # --- Update WooCommerce ---
+        if order_id and status:
+            if status in SKIP_STATUSES:
+                print(
+                    f"⏭️ Skipping WooCommerce update for order {order_id} (status {status})")
+            else:
+                wc_status = WC_STATUS_MAPPING.get(status)
+                if wc_status:
+                    update_wc_order_status(order_id, wc_status)
+                else:
+                    print(f"⚠️ No WooCommerce mapping for status '{status}'")
+
+        # --- Update Firebase ---
+        if db:
+            user_id = order_id.split("_")[0] if "_" in order_id else "guest"
+
+            order_data = {
+                "orderID": order_id,
+                "userId": user_id,
+                "status": status,
+                "items": data.get("OrderItem", []),
+                "total": data.get("order_total", 0),
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "source": "petpooja"
+            }
+
+            db.collection("orders").document(
+                order_id).set(order_data, merge=True)
+            print(f"✅ Firebase updated for order {order_id}")
+        else:
+            print("⚠️ Firebase not initialized, skipping DB write")
+
+        return jsonify({
+            "success": True,
+            "message": "Webhook received and processed successfully",
+            "receivedData": data
+        }), 200
+
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ================= GET WEBHOOK DATA =================
+
+@app.route("/api/webhook-data", methods=["GET"])
+def get_webhook_data():
+    try:
         if not db:
-            return jsonify({"warning": "No DB"})
+            return jsonify({"success": False, "message": "Firebase not initialized"}), 500
 
-        order_id = str(data.get("orderID"))
+        orders = db.collection("orders").stream()
+        data = [doc.to_dict() for doc in orders]
 
-        user_id = order_id.split("_")[0] if "_" in order_id else "guest"
-
-        order_data = {
-            "orderID": order_id,
-            "userId": user_id,
-            "status": data.get("status"),
-            "items": data.get("OrderItem", []),
-            "total": data.get("order_total", 0),
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "createdAt": firestore.SERVER_TIMESTAMP,
-            "source": "petpooja"
-        }
-
-        db.collection("orders").document(order_id).set(order_data, merge=True)
-
-        return jsonify({"success": True})
+        return jsonify({"success": True, "data": data})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
