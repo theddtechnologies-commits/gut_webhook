@@ -3,19 +3,25 @@ import os
 import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
-from flask import Flask, request, jsonify
 
-app = Flask(__name__)
+# ================= CONFIG =================
+
+APP_KEY = "73nywgsd0ab6hu4qz51ro2kfemt8xcpv"
+APP_SECRET = "aaef5fe113c373a0a7ac4e8a6413c5b1c46c3a8b"
+ACCESS_TOKEN = "23a33ca178836da5b3144ab299ef1bc2633e21f6"
+
+REST_ID = "107556"
+
+CREATE_URL = "https://pponlineordercb.petpooja.com/save_order"
+CANCEL_URL = "https://pponlineordercb.petpooja.com/update_order_status"
+
+CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
 
 # ================= FIREBASE INIT =================
 
 if not firebase_admin._apps:
-    firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    firebase_json = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT"))
 
-    if not firebase_env:
-        raise Exception("FIREBASE_SERVICE_ACCOUNT missing")
-
-    firebase_json = json.loads(firebase_env)
     firebase_json["private_key"] = firebase_json["private_key"].replace(
         "\\n", "\n")
 
@@ -24,47 +30,54 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# ================= PETPOOJA CONFIG =================
-
-APP_KEY = "73nywgsd0ab6hu4qz51ro2kfemt8xcpv"
-APP_SECRET = "aaef5fe113c373a0a7ac4e8a6413c5b1c46c3a8b"
-ACCESS_TOKEN = "23a33ca178836da5b3144ab299ef1bc2633e21f6"
-
-REST_ID = "107556"
-
-SAVE_ORDER_URL = "https://pponlineordercb.petpooja.com/save_order"
-CANCEL_URL = "https://pponlineordercb.petpooja.com/update_order_status"
-
-CALLBACK_URL = "https://endpoint-rosy.vercel.app/api/webhook"
-
-# ================= STATUS MAP =================
-
-status_mapping = {
-    "1": "processing",
-    "2": "processing",
-    "3": "processing",
-    "10": "completed",
-    "-1": "cancelled"
-}
-
-# =========================================================
-# 🔥 CREATE ORDER
-# =========================================================
+# ================= MAIN HANDLER =================
 
 
-@app.route("/api/create-order", methods=["POST"])
-def create_order():
+def handler(request):
     try:
-        body = request.get_json()
+        path = request.path
 
-        print("🔥 Incoming Order:", body)
+        # 🔥 SAFE JSON PARSE (VERCEL FIX)
+        try:
+            raw_body = request.body
+            data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            print("📩 Incoming:", data)
+        except Exception as e:
+            print("❌ JSON ERROR:", str(e))
+            return response(400, {"error": "Invalid JSON"})
+
+        if "/create-order" in path:
+            return create_order(data)
+
+        elif "/cancel-order" in path:
+            return cancel_order(data)
+
+        elif "/webhook" in path:
+            return webhook_handler(data)
+
+        else:
+            return response(404, {"error": "Route not found"})
+
+    except Exception as e:
+        print("🔥 CRASH:", str(e))
+        return response(500, {"error": str(e)})
+
+# ================= CREATE ORDER =================
+
+
+def create_order(body):
+    try:
+        required = ["orderID", "name", "phone", "items"]
+        for f in required:
+            if f not in body:
+                return response(400, {"error": f"{f} missing"})
 
         order_id = str(body["orderID"])
 
         items = []
         for item in body["items"]:
             items.append({
-                "id": str(item.get("id")),  # MUST be Petpooja ID
+                "id": str(item.get("id") or item.get("sku")),  # SKU fallback
                 "name": item.get("name"),
                 "price": float(item.get("price", 0)),
                 "quantity": int(item.get("quantity", 1)),
@@ -78,6 +91,7 @@ def create_order():
             "restID": REST_ID,
             "device_type": "Web",
             "callback_url": CALLBACK_URL,
+
             "OrderInfo": {
                 "Customer": {
                     "name": body["name"],
@@ -91,34 +105,68 @@ def create_order():
                 },
                 "OrderItem": items
             },
+
             "payment_mode": body.get("paymentMode", "COD")
         }
 
-        res = requests.post(SAVE_ORDER_URL, json=payload, timeout=10)
+        print("📦 Sending to Petpooja:", payload)
+
+        res = requests.post(CREATE_URL, json=payload, timeout=10)
         data = res.json()
 
-        print("📩 Petpooja Response:", data)
+        print("✅ Petpooja:", data)
 
         if res.status_code != 200:
-            return jsonify({"success": False, "error": data}), 500
+            return response(500, {"error": data})
 
-        return jsonify({"success": True, "orderID": order_id})
+        return response(200, {
+            "success": True,
+            "orderID": order_id,
+            "petpooja": data
+        })
 
     except Exception as e:
-        print("❌ ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+        print("❌ CREATE ERROR:", str(e))
+        return response(500, {"error": str(e)})
+
+# ================= CANCEL ORDER =================
 
 
-# =========================================================
-# 🔥 WEBHOOK (Petpooja → Firestore)
-# =========================================================
-
-@app.route("/api/webhook", methods=["POST"])
-def webhook():
+def cancel_order(body):
     try:
-        data = request.get_json()
+        order_id = body.get("orderID")
+        reason = body.get("reason", "User cancelled")
 
-        print("🔥 WEBHOOK:", data)
+        if not order_id:
+            return response(400, {"error": "orderID required"})
+
+        payload = {
+            "app_key": APP_KEY,
+            "app_secret": APP_SECRET,
+            "access_token": ACCESS_TOKEN,
+            "restID": REST_ID,
+            "clientorderID": order_id,
+            "status": "-1",
+            "cancelReason": reason
+        }
+
+        print("🚫 Cancel:", payload)
+
+        res = requests.post(CANCEL_URL, json=payload, timeout=10)
+        data = res.json()
+
+        return response(200, {"success": True, "response": data})
+
+    except Exception as e:
+        print("❌ CANCEL ERROR:", str(e))
+        return response(500, {"error": str(e)})
+
+# ================= WEBHOOK =================
+
+
+def webhook_handler(data):
+    try:
+        print("🔔 WEBHOOK:", data)
 
         orders = []
 
@@ -127,7 +175,7 @@ def webhook():
         elif "orderID" in data:
             orders = [data]
         else:
-            return jsonify({"message": "ignored"}), 200
+            return response(200, {"message": "ignored"})
 
         for order in orders:
             order_id = str(order.get("orderID"))
@@ -138,62 +186,37 @@ def webhook():
                 "orderID": order_id,
                 "userId": user_id,
                 "status": order.get("status"),
-                "items": order.get("items") or order.get("OrderItem") or [],
+                "items": order.get("OrderItem", []),
                 "total": order.get("order_total", 0),
+                "customerName": order.get("customer_name"),
+                "customerPhone": order.get("customer_phone"),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
                 "createdAt": firestore.SERVER_TIMESTAMP,
+                "source": "petpooja",
                 "payload": order
             }
 
-            # SAVE GLOBAL
             db.collection("orders").document(
                 order_id).set(order_data, merge=True)
 
-            # SAVE USER
             db.collection("users").document(user_id)\
                 .collection("orders").document(order_id)\
                 .set(order_data, merge=True)
 
-        return jsonify({"success": True})
+        return response(200, {"success": True})
 
     except Exception as e:
-        print("❌ ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
+        print("❌ WEBHOOK ERROR:", str(e))
+        return response(500, {"error": str(e)})
+
+# ================= RESPONSE =================
 
 
-# =========================================================
-# 🔥 CANCEL ORDER
-# =========================================================
-
-@app.route("/api/cancel-order", methods=["POST"])
-def cancel_order():
-    try:
-        body = request.get_json()
-
-        order_id = body.get("orderID")
-        reason = body.get("reason", "User cancelled")
-
-        payload = {
-            "app_key": APP_KEY,
-            "app_secret": APP_SECRET,
-            "access_token": ACCESS_TOKEN,
-            "restID": REST_ID,
-            "clientorderID": str(order_id),
-            "status": "-1",
-            "cancelReason": reason
-        }
-
-        res = requests.post(CANCEL_URL, json=payload, timeout=10)
-        data = res.json()
-
-        print("🔥 Cancel Response:", data)
-
-        return jsonify({"success": True, "response": data})
-
-    except Exception as e:
-        print("❌ ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
-
-
-# REQUIRED FOR VERCEL
-app = app
+def response(status, body):
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "application/json"
+        },
+        "body": json.dumps(body)
+    }
